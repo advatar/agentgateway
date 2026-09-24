@@ -364,14 +364,31 @@ fn translate_error(method: &str, backends: &[String], e: AuthorizationError) -> 
 		C::Invalid => ErrorCode::INVALID_REQUEST,
 		C::Unknown => ErrorCode::INTERNAL_ERROR,
 	};
-	let data = e.mcp_error.as_deref().and_then(|b| {
+	let payload = e.mcp_error.as_deref().and_then(|b| {
 		serde_json::from_slice::<Value>(b)
 			.map_err(
 				|err| warn!(method, ?backends, error = %err, "mcpGuardrails: ignoring unparseable mcp_error payload"),
 			)
 			.ok()
 	});
-	ErrorData::new(code, e.reason, data)
+	match payload {
+		Some(Value::Object(mut err)) if explicit_code(&err).is_some() => {
+			let code = ErrorCode(explicit_code(&err).expect("checked by guard"));
+			let message = match err.remove("message") {
+				Some(Value::String(m)) => m,
+				_ => e.reason,
+			};
+			ErrorData::new(code, message, err.remove("data"))
+		},
+		data => ErrorData::new(code, e.reason, data),
+	}
+}
+
+fn explicit_code(err: &serde_json::Map<String, Value>) -> Option<i32> {
+	err
+		.get("code")
+		.and_then(Value::as_i64)
+		.and_then(|c| i32::try_from(c).ok())
 }
 
 fn on_grpc_error<T>(
@@ -423,6 +440,84 @@ mod tests {
 
 	fn struct_from_json(v: serde_json::Value) -> ProtoStruct {
 		serde_json::from_value(v).unwrap()
+	}
+
+	fn auth_error(
+		code: wire::authorization_error::Code,
+		mcp_error: Option<Value>,
+	) -> AuthorizationError {
+		AuthorizationError {
+			code: code as i32,
+			reason: "reason from processor".into(),
+			mcp_error: mcp_error.map(|v| serde_json::to_vec(&v).unwrap().into()),
+		}
+	}
+
+	#[test]
+	fn translate_error_without_payload_uses_the_enum_code() {
+		use wire::authorization_error::Code;
+		let err = translate_error("tools/call", &[], auth_error(Code::PermissionDenied, None));
+		assert_eq!(err.code, PERMISSION_DENIED);
+		assert_eq!(err.message, "reason from processor");
+		assert_eq!(err.data, None);
+	}
+
+	#[test]
+	fn translate_error_keeps_a_plain_payload_as_data() {
+		use wire::authorization_error::Code;
+		let blob = serde_json::json!({"policy": "p-17", "code": "not-an-integer"});
+		let err = translate_error(
+			"tools/call",
+			&[],
+			auth_error(Code::PermissionDenied, Some(blob.clone())),
+		);
+		assert_eq!(err.code, PERMISSION_DENIED);
+		assert_eq!(err.message, "reason from processor");
+		assert_eq!(err.data, Some(blob));
+	}
+
+	#[test]
+	fn translate_error_honours_an_explicit_jsonrpc_error() {
+		use wire::authorization_error::Code;
+		let elicitation = serde_json::json!({
+			"elicitations": [{"mode": "url", "elicitationId": "e-1", "url": "https://auth.example/a/1", "message": "Approve"}]
+		});
+		let payload = serde_json::json!({
+			"code": -32042,
+			"message": "URL elicitation required",
+			"data": elicitation,
+		});
+		let err = translate_error(
+			"tools/call",
+			&[],
+			auth_error(Code::PermissionDenied, Some(payload)),
+		);
+		assert_eq!(err.code, crate::mcp::URL_ELICITATION_REQUIRED);
+		assert_eq!(err.message, "URL elicitation required");
+		assert_eq!(err.data, Some(elicitation));
+	}
+
+	#[test]
+	fn translate_error_explicit_code_without_message_keeps_the_reason() {
+		use wire::authorization_error::Code;
+		let payload = serde_json::json!({"code": -32042});
+		let err = translate_error("tools/call", &[], auth_error(Code::Unknown, Some(payload)));
+		assert_eq!(err.code, crate::mcp::URL_ELICITATION_REQUIRED);
+		assert_eq!(err.message, "reason from processor");
+		assert_eq!(err.data, None);
+	}
+
+	#[test]
+	fn translate_error_out_of_range_code_is_not_an_override() {
+		use wire::authorization_error::Code;
+		let payload = serde_json::json!({"code": 9_999_999_999_i64});
+		let err = translate_error(
+			"tools/call",
+			&[],
+			auth_error(Code::PermissionDenied, Some(payload.clone())),
+		);
+		assert_eq!(err.code, PERMISSION_DENIED);
+		assert_eq!(err.data, Some(payload));
 	}
 
 	#[test]

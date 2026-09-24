@@ -61,6 +61,8 @@ impl agent_http::BodyExtension for CachedRequest {}
 /// Application-defined "over quota" code (MCP defines none); shared with the guardrail mapping.
 pub(crate) const RESOURCE_EXHAUSTED: ErrorCode = ErrorCode(-32003);
 
+pub(crate) const URL_ELICITATION_REQUIRED: ErrorCode = ErrorCode(-32042);
+
 /// Method names of rmcp's typed `ClientRequest` variants. Keep this list in sync with rmcp rev
 /// bumps; only `CustomRequest` and failed typed parses consult it, so drift cannot 404 typed
 /// requests.
@@ -198,6 +200,10 @@ pub enum Error {
 	NoBackends,
 }
 
+fn guardrail_rejection_is_protocol_error(code: ErrorCode) -> bool {
+	code == ErrorCode::INTERNAL_ERROR || code == URL_ELICITATION_REQUIRED
+}
+
 fn tool_error_body(
 	request_id: &RequestId,
 	text: String,
@@ -241,7 +247,7 @@ impl Error {
 				rej,
 				was_tool_call: true,
 				downstream_modern,
-			} if rej.code != ErrorCode::INTERNAL_ERROR => {
+			} if !guardrail_rejection_is_protocol_error(rej.code) => {
 				return tool_error_body(request_id, rej.message.to_string(), *downstream_modern);
 			},
 			_ => {},
